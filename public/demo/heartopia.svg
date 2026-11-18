@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="800" viewBox="0 0 1200 800" role="img" aria-labelledby="title">
+<title id="title">Heartopia — ตัวอย่างภาพโปรโมชัน Supersix Shop</title>
+<defs>
+<linearGradient id="bg" x2="1" y2="1"><stop stop-color="#183E33"/><stop offset="1" stop-color="#0B2822"/></linearGradient>
+<linearGradient id="heart" x2="1" y2="1"><stop stop-color="#EBF4C9"/><stop offset=".5" stop-color="#B7E2AE"/><stop offset="1" stop-color="#68AF93"/></linearGradient>
+<linearGradient id="arch" x2="0" y2="1"><stop stop-color="#486E53"/><stop offset="1" stop-color="#244D3B"/></linearGradient>
+<radialGradient id="glow"><stop stop-color="#9ACB9D" stop-opacity=".28"/><stop offset="1" stop-color="#9ACB9D" stop-opacity="0"/></radialGradient>
+</defs>
+<rect width="1200" height="800" fill="url(#bg)"/><circle cx="926" cy="345" r="410" fill="url(#glow)"/>
+<path d="M0 636C184 574 362 735 580 662S949 593 1200 702V800H0Z" fill="#204636"/><path d="M0 737C190 663 382 804 604 731S1003 695 1200 761V800H0Z" fill="#173A2F"/>
+<g font-family="Arial, Noto Sans Thai, sans-serif">
+<rect x="64" y="52" width="50" height="50" rx="15" fill="#D7E9B5"/><text x="89" y="85" text-anchor="middle" font-size="21" font-weight="800" fill="#1E3B2C">S6</text><text x="130" y="84" font-size="21" font-weight="600" letter-spacing="2" fill="#E3EBCF">SUPERSIX SHOP</text>
+<rect x="1000" y="58" width="136" height="37" rx="18.5" fill="#D5E6C5" fill-opacity=".1" stroke="#D5E6C5" stroke-opacity=".25"/><text x="1068" y="83" text-anchor="middle" font-size="18" fill="#D9E6D3">ตัวอย่างงาน</text>
+<text x="64" y="231" font-size="18" letter-spacing="5" fill="#A2C6A7">A LITTLE EVERYDAY JOY</text><text x="59" y="329" font-size="91" font-weight="800" letter-spacing="-4" fill="#F0F2DB">HEARTOPIA</text>
+<text x="64" y="409" font-size="43" font-weight="500" fill="#DCE8CB">เติมความสุข</text><text x="64" y="469" font-size="43" font-weight="500" fill="#DCE8CB">ให้วันธรรมดา</text>
+<rect x="64" y="518" width="227" height="54" rx="27" fill="#C7DEAF"/><text x="177" y="553" text-anchor="middle" font-size="20" font-weight="600" fill="#234332">ภาพโปรโมชันประจำร้าน</text>
+<line x1="64" y1="704" x2="1136" y2="704" stroke="#B7D0A9" stroke-opacity=".26"/><text x="64" y="745" font-size="17" letter-spacing="2" fill="#AFC4A9">CREATIVE CONCEPT / 01</text><text x="1136" y="745" text-anchor="end" font-size="17" fill="#AFC4A9">ออกแบบให้ทุกวันมีสีสัน</text></g>
+<path d="M713 576V285a183 183 0 0 1 366 0v291Z" fill="url(#arch)" stroke="#BDD2A7" stroke-opacity=".22" stroke-width="2"/><ellipse cx="896" cy="579" rx="211" ry="46" fill="#0D2C23"/><ellipse cx="896" cy="568" rx="190" ry="31" fill="#A0BB86"/><ellipse cx="896" cy="563" rx="171" ry="23" fill="#BFD2A0"/>
+<path d="M896 487C868 463 785 405 785 348C785 291 853 275 896 326C939 275 1007 291 1007 348C1007 405 924 463 896 487Z" fill="url(#heart)"/><path d="M896 326C862 293 820 304 813 338" fill="none" stroke="#F4F8DF" stroke-opacity=".7" stroke-width="7" stroke-linecap="round"/><path d="M896 487L896 326L1007 348Z" fill="#5D9D7E" fill-opacity=".24"/>
+<path d="M759 578C743 532 720 507 688 480M1035 573C1049 521 1086 478 1111 463" fill="none" stroke="#A3C197" stroke-width="5" stroke-linecap="round"/><path d="M744 544C705 547 675 522 676 490C716 490 741 509 744 544ZM1061 520C1105 526 1130 503 1134 472C1098 471 1074 489 1061 520Z" fill="#6D9D77"/><path d="M727 516C734 480 716 455 687 447C679 477 693 503 727 516ZM1079 491C1054 467 1057 438 1079 416C1102 439 1102 467 1079 491Z" fill="#99B88B"/>
+<g fill="#E7EDC8"><path d="M1044 230l5 17 17 5-17 5-5 17-5-17-17-5 17-5ZM762 369l4 11 11 4-11 4-4 11-4-11-11-4 11-4Z"/><circle cx="997" cy="450" r="4"/><circle cx="811" cy="242" r="4"/></g></svg>

@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: supersix-studio
+    runtime: node
+    plan: starter
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: NODE_ENV
+        value: production
+      - key: APP_MODE
+        value: hosted
+      - key: APP_USERNAME
+        value: super6
+      - key: APP_PASSWORD
+        generateValue: true
+      - key: STORAGE_PATH
+        value: /var/data/supersix-studio
+      - key: MAX_UPLOAD_MB
+        value: "500"
+    disk:
+      name: supersix-data
+      mountPath: /var/data
+      sizeGB: 10
