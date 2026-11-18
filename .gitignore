@@ -2,6 +2,9 @@ node_modules/
 dist/
 data/
 .env
+.env.*
+!.env.example
+server/generated/
 *.log
 *.sqlite
 *.sqlite-shm

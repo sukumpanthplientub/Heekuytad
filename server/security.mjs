@@ -6,18 +6,12 @@ export function localRequestGuard({
   port,
   dev = false,
   hosted = false,
-  publicOrigin = "",
   appUsername = "super6",
   appPassword = "",
 }) {
-  if (hosted && (!publicOrigin || appPassword.length < 16))
-    throw new Error("Hosted requests require a public origin and APP_PASSWORD");
-  const hosts = hosted
-    ? new Set([new URL(publicOrigin).host.toLowerCase()])
-    : new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
-  const origins = hosted
-    ? new Set([publicOrigin])
-    : new Set([...hosts].map((host) => `http://${host}`));
+  if (hosted && !appPassword) throw new Error("Hosted requests require APP_PASSWORD");
+  const hosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
+  const localOrigins = new Set([...hosts].map((host) => `http://${host}`));
   const loopbackAddresses = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
   const safeMethods = new Set(["GET", "HEAD", "OPTIONS"]);
   const digest = (text) => createHash("sha256").update(text).digest();
@@ -57,8 +51,25 @@ export function localRequestGuard({
     }
     if (!hosted && !loopbackAddresses.has(req.socket.remoteAddress))
       return reject("โปรแกรมนี้เปิดให้ใช้งานเฉพาะภายในเครื่อง");
-    if (!hosts.has(String(req.headers.host || "").toLowerCase()))
-      return reject("เปิดโปรแกรมจาก URL ที่ตั้งค่าไว้");
+    const host = String(req.headers.host || "").toLowerCase();
+    let origins = localOrigins;
+    if (hosted) {
+      // Use the request's domain, never client-supplied forwarding headers.
+      // The production reverse proxy terminates HTTPS before forwarding to Node.
+      let url;
+      try {
+        url = new URL(`https://${host}`);
+      } catch {
+        return reject("Invalid request host");
+      }
+      if (!host || /[\s\\/@?#]/.test(host) || url.username || url.password)
+        return reject("Invalid request host");
+      const localHttp =
+        loopbackAddresses.has(req.socket.remoteAddress) &&
+        ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+      origins = new Set([url.origin]);
+      if (localHttp) origins.add(new URL(`http://${host}`).origin);
+    } else if (!hosts.has(host)) return reject("เปิดโปรแกรมจาก URL ที่ตั้งค่าไว้");
 
     if (hosted) {
       const match = /^Basic ([A-Za-z0-9+/]+={0,2})$/i.exec(String(req.headers.authorization || ""));

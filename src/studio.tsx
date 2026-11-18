@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type SetStateAction } from "react";
 import {
   Plus,
   Search,
@@ -9,7 +9,6 @@ import {
   PanelsTopLeft,
   List,
   Film,
-  Check,
   Clock3,
   CalendarDays,
   SlidersHorizontal,
@@ -53,6 +52,8 @@ import { Modal, JobForm, PostDialog, SettingsDialog } from "./studio-forms";
 import { StorageDialog, TrashDialog } from "./local-panels";
 import { api } from "./lib/api";
 import { normalizeMediaFile } from "./lib/media";
+import { getPreference, setPreference } from "./lib/preferences";
+import { createSnapshotVersion } from "./lib/snapshot-version";
 
 type Tab = "all" | "pending" | "ready" | "posted";
 type Notice = { text: string; error?: boolean; action?: () => void; label?: string };
@@ -124,6 +125,13 @@ export default function Studio() {
     [mobileMenu, setMobileMenu] = useState(false);
   const [busyJobs, setBusyJobs] = useState<string[]>([]);
   const mutatingJobs = useRef(new Set<string>());
+  const snapshotVersion = useRef(createSnapshotVersion());
+  const loadController = useRef<AbortController | null>(null);
+  const applyJobs = useCallback((value: SetStateAction<Job[]>) => {
+    snapshotVersion.current.changed();
+    setJobs(value);
+  }, []);
+  const [page, setPage] = useState({ key: "", count: 48 });
   const searchRef = useRef<HTMLInputElement>(null),
     noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null),
     uploadLocked = useRef(false),
@@ -136,31 +144,40 @@ export default function Studio() {
     },
     [],
   );
-  const load = useCallback(async (initial = false) => {
+  const load = useCallback(async function refresh(initial = false): Promise<void> {
+    loadController.current?.abort();
+    const controller = new AbortController();
+    loadController.current = controller;
+    const request = snapshotVersion.current.begin();
     setError("");
     try {
-      const data = await api<StudioData>("/api/studio");
+      const data = await api<StudioData>("/api/studio", "GET", undefined, {
+        signal: controller.signal,
+      });
+      if (!request.current()) return;
+      // A save finished while this snapshot was in flight. Fetch its newer state
+      // instead of putting old jobs/settings back into the UI.
+      if (request.stale()) return refresh(false);
       setJobs(data.jobs);
       setSettings(data.settings);
       setStorage(data.storage);
-      if (
-        initial &&
-        data.jobs.length === 0 &&
-        localStorage.getItem("supersix-demo-dismissed") !== "1"
-      )
+      if (initial && data.jobs.length === 0 && getPreference("supersix-demo-dismissed") !== "1")
         setDemoMode(true);
     } catch (e) {
-      setError(errorText(e));
+      if (request.current() && !controller.signal.aborted) setError(errorText(e));
     } finally {
-      setLoading(false);
+      if (request.current()) setLoading(false);
     }
   }, []);
   useEffect(() => {
+    const version = snapshotVersion.current;
     void load(true);
-    if (localStorage.getItem("supersix-view") === "compact") setView("compact");
+    if (getPreference("supersix-view") === "compact") setView("compact");
     const timer = setInterval(() => setToday(thaiDateKey()), 30000);
     return () => {
       clearInterval(timer);
+      version.cancel();
+      loadController.current?.abort();
       if (noticeTimer.current) clearTimeout(noticeTimer.current);
     };
   }, [load]);
@@ -197,43 +214,67 @@ export default function Studio() {
   }, [form]);
   const maxUploadBytes = storage?.maxUploadBytes ?? DEFAULT_MAX_FILE;
   const allJobs = demoMode ? demoJobs : jobs;
-  const inStore = allJobs.filter(
-    (j) => (shop === "all" || j.store === shop) && j.archived === archived,
+  const inStore = useMemo(
+    () => allJobs.filter((j) => (shop === "all" || j.store === shop) && j.archived === archived),
+    [allJobs, shop, archived],
   );
-  const counts = {
-    all: inStore.length,
-    pending: inStore.filter((j) => j.workStatus !== "done").length,
-    ready: inStore.filter((j) => j.workStatus === "done" && j.postStatus !== "posted").length,
-    posted: inStore.filter((j) => j.postStatus === "posted").length,
-  };
-  const visibleJobs = inStore
-    .filter((j) => {
-      if (tab === "pending" && j.workStatus === "done") return false;
-      if (tab === "ready" && (j.workStatus !== "done" || j.postStatus === "posted")) return false;
-      if (tab === "posted" && j.postStatus !== "posted") return false;
-      if (typeFilter !== "all" && j.type !== typeFilter) return false;
-      if (dateFilter === "today" && j.plannedDate !== today && j.dueDate !== today) return false;
-      if (dateFilter === "overdue" && (!j.dueDate || j.dueDate >= today || j.workStatus === "done"))
-        return false;
-      if (dateFilter === "date" && j.plannedDate !== selectedDate && j.dueDate !== selectedDate)
-        return false;
-      if (
-        query &&
-        !`${j.title} ${j.requester} ${j.brief} ${storeName(j.store)}`
-          .toLocaleLowerCase()
-          .includes(query.toLocaleLowerCase())
-      )
-        return false;
-      return true;
-    })
-    .sort((a, b) =>
-      sort === "newest"
-        ? b.createdAt.localeCompare(a.createdAt)
-        : Number(a.workStatus === "done") - Number(b.workStatus === "done") ||
-          Number(b.priority === "high") - Number(a.priority === "high") ||
-          (a.dueDate || "9999").localeCompare(b.dueDate || "9999") ||
-          b.createdAt.localeCompare(a.createdAt),
-    );
+  const counts = useMemo(
+    () => ({
+      all: inStore.length,
+      pending: inStore.filter((j) => j.workStatus !== "done").length,
+      ready: inStore.filter((j) => j.workStatus === "done" && j.postStatus !== "posted").length,
+      posted: inStore.filter((j) => j.postStatus === "posted").length,
+    }),
+    [inStore],
+  );
+  const visibleJobs = useMemo(
+    () =>
+      inStore
+        .filter((j) => {
+          if (tab === "pending" && j.workStatus === "done") return false;
+          if (tab === "ready" && (j.workStatus !== "done" || j.postStatus === "posted"))
+            return false;
+          if (tab === "posted" && j.postStatus !== "posted") return false;
+          if (typeFilter !== "all" && j.type !== typeFilter) return false;
+          if (dateFilter === "today" && j.plannedDate !== today && j.dueDate !== today)
+            return false;
+          if (
+            dateFilter === "overdue" &&
+            (!j.dueDate || j.dueDate >= today || j.workStatus === "done")
+          )
+            return false;
+          if (dateFilter === "date" && j.plannedDate !== selectedDate && j.dueDate !== selectedDate)
+            return false;
+          if (
+            query &&
+            !`${j.title} ${j.requester} ${j.brief} ${storeName(j.store)}`
+              .toLocaleLowerCase()
+              .includes(query.toLocaleLowerCase())
+          )
+            return false;
+          return true;
+        })
+        .sort((a, b) =>
+          sort === "newest"
+            ? b.createdAt.localeCompare(a.createdAt)
+            : Number(a.workStatus === "done") - Number(b.workStatus === "done") ||
+              Number(b.priority === "high") - Number(a.priority === "high") ||
+              (a.dueDate || "9999").localeCompare(b.dueDate || "9999") ||
+              b.createdAt.localeCompare(a.createdAt),
+        ),
+    [inStore, tab, typeFilter, dateFilter, today, selectedDate, query, sort],
+  );
+  const pageKey = JSON.stringify([
+    shop,
+    archived,
+    tab,
+    query,
+    dateFilter,
+    selectedDate,
+    typeFilter,
+    sort,
+  ]);
+  const pageCount = page.key === pageKey ? page.count : 48;
   const currentShop = STORES.find((s) => s.id === shop);
   const activeReel = settings.reelEnabled && isReelDay(today, settings.reelAnchor);
   const nextReel = settings.reelAnchor
@@ -263,11 +304,11 @@ export default function Studio() {
   };
   const exitDemo = () => {
     setDemoMode(false);
-    localStorage.setItem("supersix-demo-dismissed", "1");
+    setPreference("supersix-demo-dismissed", "1");
     resetFilters();
   };
   const replaceJob = (job: Job) =>
-    setJobs((prev) =>
+    applyJobs((prev) =>
       prev.some((j) => j.id === job.id)
         ? prev.map((j) => (j.id === job.id ? job : j))
         : [job, ...prev],
@@ -350,7 +391,7 @@ export default function Studio() {
           const payload = new FormData();
           payload.append("file", file);
           const data = await api<{ asset: Asset }>(`/api/jobs/${job.id}/assets`, "POST", payload);
-          setJobs((prev) =>
+          applyJobs((prev) =>
             prev.map((j) =>
               j.id === job.id
                 ? { ...j, assets: [...j.assets, data.asset], updatedAt: data.asset.createdAt }
@@ -416,14 +457,14 @@ export default function Studio() {
         );
       } else if (asset) {
         await api(`/api/assets/${asset.id}`, "DELETE");
-        setJobs((prev) =>
+        applyJobs((prev) =>
           prev.map((j) =>
             j.id === job.id ? { ...j, assets: j.assets.filter((a) => a.id !== asset.id) } : j,
           ),
         );
       } else {
         await api(`/api/jobs/${job.id}`, "DELETE");
-        setJobs((prev) => prev.filter((j) => j.id !== job.id));
+        applyJobs((prev) => prev.filter((j) => j.id !== job.id));
       }
       setConfirm(null);
       if (isDemo(job)) notify("นำข้อมูลตัวอย่างออกแล้ว");
@@ -876,7 +917,7 @@ export default function Studio() {
                   title="แสดงภาพใหญ่"
                   onClick={() => {
                     setView("large");
-                    localStorage.setItem("supersix-view", "large");
+                    setPreference("supersix-view", "large");
                   }}
                 >
                   <PanelsTopLeft size={18} />
@@ -887,7 +928,7 @@ export default function Studio() {
                   title="แสดงรายการย่อ"
                   onClick={() => {
                     setView("compact");
-                    localStorage.setItem("supersix-view", "compact");
+                    setPreference("supersix-view", "compact");
                   }}
                 >
                   <List size={19} />
@@ -995,44 +1036,56 @@ export default function Studio() {
                 )}
               </div>
             ) : (
-              <div className={`jobs-grid view-${view}`}>
-                {visibleJobs.map((job) => (
-                  <JobCard
-                    key={job.id}
-                    job={job}
-                    today={today}
-                    checkDate={dateFilter === "date" ? selectedDate : today}
-                    busy={
-                      busyId === job.id ||
-                      busyJobs.includes(job.id) ||
-                      uploadProgress?.jobId === job.id
-                    }
-                    uploading={uploadProgress?.jobId === job.id ? uploadProgress.text : ""}
-                    onFiles={(files) => void uploadFiles(job, files)}
-                    onStart={() => void updateJob(job, { workStatus: "doing" }).catch(() => {})}
-                    onStatus={() =>
-                      void updateJob(job, {
-                        workStatus: job.workStatus === "done" ? "doing" : "done",
-                      }).catch(() => {})
-                    }
-                    onPost={() => setPostJob(job)}
-                    onEdit={() => setForm({ job, type: job.type })}
-                    onArchive={() =>
-                      void updateJob(job, { archived: !job.archived }).catch(() => {})
-                    }
-                    onDelete={() => setConfirm({ job })}
-                    onRemoveAsset={(asset) => setConfirm({ job, asset })}
-                    onOpenFolder={() => void openFolder(job)}
-                    canOpenFolder={storage?.canOpenFolder === true}
-                    maxUploadBytes={maxUploadBytes}
-                    menuOpen={menuId === job.id}
-                    onMenu={(e) => {
-                      e.stopPropagation();
-                      setMenuId(menuId === job.id ? null : job.id);
-                    }}
-                  />
-                ))}
-              </div>
+              <>
+                <div className={`jobs-grid view-${view}`}>
+                  {visibleJobs.slice(0, pageCount).map((job) => (
+                    <JobCard
+                      key={job.id}
+                      job={job}
+                      today={today}
+                      checkDate={dateFilter === "date" ? selectedDate : today}
+                      busy={
+                        busyId === job.id ||
+                        busyJobs.includes(job.id) ||
+                        uploadProgress?.jobId === job.id
+                      }
+                      uploading={uploadProgress?.jobId === job.id ? uploadProgress.text : ""}
+                      onFiles={(files) => void uploadFiles(job, files)}
+                      onStart={() => void updateJob(job, { workStatus: "doing" }).catch(() => {})}
+                      onStatus={() =>
+                        void updateJob(job, {
+                          workStatus: job.workStatus === "done" ? "doing" : "done",
+                        }).catch(() => {})
+                      }
+                      onPost={() => setPostJob(job)}
+                      onEdit={() => setForm({ job, type: job.type })}
+                      onArchive={() =>
+                        void updateJob(job, { archived: !job.archived }).catch(() => {})
+                      }
+                      onDelete={() => setConfirm({ job })}
+                      onRemoveAsset={(asset) => setConfirm({ job, asset })}
+                      onOpenFolder={() => void openFolder(job)}
+                      canOpenFolder={storage?.canOpenFolder === true}
+                      maxUploadBytes={maxUploadBytes}
+                      menuOpen={menuId === job.id}
+                      onMenu={(e) => {
+                        e.stopPropagation();
+                        setMenuId(menuId === job.id ? null : job.id);
+                      }}
+                    />
+                  ))}
+                </div>
+                {visibleJobs.length > pageCount && (
+                  <div className="load-more-jobs">
+                    <button
+                      className="btn btn-secondary"
+                      onClick={() => setPage({ key: pageKey, count: pageCount + 48 })}
+                    >
+                      แสดงงานเพิ่ม · เหลือ {visibleJobs.length - pageCount} งาน
+                    </button>
+                  </div>
+                )}
+              </>
             )}
           </section>
           <footer className="workspace-footer">
@@ -1048,8 +1101,7 @@ export default function Studio() {
                 "เชื่อมต่อไม่สำเร็จ"
               ) : (
                 <>
-                  <HardDrive size={14} />{" "}
-                  {hosted ? "บันทึกบนเซิร์ฟเวอร์ส่วนตัว" : "บันทึกในเครื่องของคุณ"}
+                  <HardDrive size={14} /> บันทึกข้อมูลในฐานข้อมูลออนไลน์
                 </>
               )}
             </span>
@@ -1090,6 +1142,7 @@ export default function Studio() {
           onClose={() => setShowSettings(false)}
           onSave={async (value) => {
             const data = await api<{ settings: StudioSettings }>("/api/settings", "PATCH", value);
+            snapshotVersion.current.changed();
             setSettings(data.settings);
             setShowSettings(false);
             notify("บันทึกรอบทำ Reel แล้ว");

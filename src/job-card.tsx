@@ -1,4 +1,12 @@
-import { useEffect, useId, useRef, useState, type DragEvent, type MouseEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type DragEvent,
+  type MouseEvent,
+} from "react";
 import {
   Archive,
   ArrowUpRight,
@@ -122,26 +130,29 @@ export function JobCard({
           ? `มีไฟล์อัปเดต${dateLabel}`
           : `ยังไม่มีไฟล์อัปเดต${dateLabel}`;
 
-  function showAsset(index: number, behavior: ScrollBehavior = "smooth") {
-    const container = gallery.current;
-    if (!container) return;
-    const next = Math.max(0, Math.min(index, job.assets.length - 1));
-    const element = container.children[next] as HTMLElement | undefined;
-    if (!element) return;
-    const left =
-      element.getBoundingClientRect().left -
-      container.getBoundingClientRect().left +
-      container.scrollLeft;
-    container.scrollTo({ left, behavior });
-    setActiveAsset(next);
-  }
+  const showAsset = useCallback(
+    (index: number, behavior: ScrollBehavior = "smooth") => {
+      const container = gallery.current;
+      if (!container) return;
+      const next = Math.max(0, Math.min(index, job.assets.length - 1));
+      const element = container.children[next] as HTMLElement | undefined;
+      if (!element) return;
+      const left =
+        element.getBoundingClientRect().left -
+        container.getBoundingClientRect().left +
+        container.scrollLeft;
+      container.scrollTo({ left, behavior });
+      setActiveAsset(next);
+    },
+    [job.assets.length],
+  );
 
   useEffect(() => {
     const count = job.assets.length;
     if (count > previousAssetCount.current) showAsset(count - 1);
     else if (activeAsset >= count) showAsset(Math.max(0, count - 1), "auto");
     previousAssetCount.current = count;
-  }, [job.assets.length]); // File membership, not card status, determines gallery position.
+  }, [activeAsset, job.assets.length, showAsset]);
 
   useEffect(() => {
     setActiveAsset(0);
@@ -252,7 +263,7 @@ export function JobCard({
                       src={asset.url}
                       controls
                       playsInline
-                      preload="metadata"
+                      preload={index === activeAsset ? "metadata" : "none"}
                       aria-label={`คลิป ${asset.name}`}
                       onError={() => failMedia(asset.id)}
                     >

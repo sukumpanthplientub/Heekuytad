@@ -1,12 +1,19 @@
 /** API requests use the same origin as this application. */
-export async function api<T>(path: string, method = "GET", body?: unknown): Promise<T> {
+export async function api<T>(
+  path: string,
+  method = "GET",
+  body?: unknown,
+  options: { signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<T> {
   const isForm = body instanceof FormData;
-  let response: Response;
+  const timeout = AbortSignal.timeout(options.timeoutMs ?? (isForm ? 30 * 60 * 1000 : 30000));
+  const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
   try {
-    response = await fetch(path, {
+    const response = await fetch(path, {
       method,
       credentials: "same-origin",
       cache: "no-store",
+      signal,
       ...(body === undefined
         ? {}
         : {
@@ -14,21 +21,26 @@ export async function api<T>(path: string, method = "GET", body?: unknown): Prom
             body: isForm ? body : JSON.stringify(body),
           }),
     });
-  } catch {
-    throw new Error("เชื่อมต่อ Supersix Studio ไม่ได้ ตรวจการเชื่อมต่อแล้วลองอีกครั้ง");
+    const data: unknown = response.status === 204 ? {} : await response.json().catch(() => null);
+    if (!response.ok || !data || typeof data !== "object") {
+      const message =
+        data && typeof data === "object" && "error" in data && typeof data.error === "string"
+          ? data.error
+          : "ไม่สามารถอ่านข้อมูลจากโปรแกรมได้ กรุณาโหลดข้อมูลล่าสุดแล้วลองอีกครั้ง";
+      const error = new Error(message) as Error & { status: number };
+      error.status = response.status;
+      throw error;
+    }
+    return data as T;
+  } catch (error) {
+    if (options.signal?.aborted) throw error;
+    if (timeout.aborted)
+      throw new Error("คำขอใช้เวลานานเกินไป กรุณาโหลดข้อมูลล่าสุดก่อนลองอีกครั้ง", {
+        cause: error,
+      });
+    if (error instanceof Error && "status" in error) throw error;
+    throw new Error("เชื่อมต่อ Supersix Studio ไม่ได้ ตรวจการเชื่อมต่อแล้วลองอีกครั้ง", {
+      cause: error,
+    });
   }
-  const data =
-    response.status === 204
-      ? {}
-      : await response.json().catch(() => ({
-          error: "ไม่สามารถอ่านข้อมูลจากโปรแกรมได้ กรุณาลองอีกครั้ง",
-        }));
-  if (!response.ok) {
-    const error = new Error(
-      typeof data.error === "string" ? data.error : "บันทึกไม่สำเร็จ กรุณาลองอีกครั้ง",
-    ) as Error & { status: number };
-    error.status = response.status;
-    throw error;
-  }
-  return data as T;
 }

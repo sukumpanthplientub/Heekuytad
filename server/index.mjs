@@ -4,6 +4,7 @@ import path from "node:path";
 import express from "express";
 import { loadConfiguration, PROJECT_ROOT } from "./config.mjs";
 import { localRequestGuard } from "./security.mjs";
+import { createReadinessCheck } from "./readiness.mjs";
 
 if (Number(process.versions.node.split(".")[0]) < 24) {
   console.error("Supersix Studio ต้องใช้ Node.js 24 ขึ้นไป: https://nodejs.org/en/download");
@@ -13,21 +14,33 @@ if (Number(process.versions.node.split(".")[0]) < 24) {
 let studio;
 let vite;
 let server;
+let shuttingDown = false;
 try {
   const config = loadConfiguration();
   const app = express();
+  app.set("env", config.dev ? "development" : "production");
   app.disable("x-powered-by");
   app.set("trust proxy", false);
+  app.use((_req, res, next) => {
+    if (!shuttingDown) return next();
+    res.set({ Connection: "close", "Retry-After": "5", "Cache-Control": "no-store" });
+    res.status(503).json({ error: "ระบบกำลังเริ่มใหม่ กรุณาลองอีกครั้ง" });
+  });
   app.use(localRequestGuard(config));
 
   // Import after the Node-version check so old versions show a useful message.
   const { createStudioApi } = await import("./api.mjs");
-  studio = createStudioApi({
+  studio = await createStudioApi({
     storagePath: config.storagePath,
+    databaseUrl: config.databaseUrl,
     maxUploadBytes: config.maxUploadBytes,
     hosted: config.hosted,
   });
-  app.get("/api/health", (_req, res) => res.json({ ok: true }));
+  const ready = createReadinessCheck(() => studio.health());
+  app.get("/api/health", async (_req, res) => {
+    const ok = await ready();
+    res.status(ok ? 200 : 503).json({ ok });
+  });
   app.use("/api", studio.router);
   app.use("/api", (_req, res) => res.status(404).json({ error: "ไม่พบคำสั่งนี้" }));
 
@@ -38,7 +51,6 @@ try {
   server.headersTimeout = 60 * 1000;
 
   if (config.dev) {
-    process.env.NODE_ENV = "development";
     const { createServer: createViteServer } = await import("vite");
     vite = await createViteServer({
       root: PROJECT_ROOT,
@@ -78,6 +90,17 @@ try {
     } catch {
       throw new Error("ไม่พบไฟล์หน้าเว็บ กรุณารัน npm run build ก่อน แล้วรัน npm start อีกครั้ง");
     }
+    // Only fingerprinted build assets are immutable; page/API/media stay private.
+    app.use(
+      "/assets",
+      express.static(path.join(distPath, "assets"), {
+        index: false,
+        dotfiles: "deny",
+        immutable: true,
+        maxAge: "1y",
+        setHeaders: (res) => res.setHeader("Cache-Control", "private, max-age=31536000, immutable"),
+      }),
+    );
     app.use(express.static(distPath, { index: false, dotfiles: "deny" }));
     app.get("/", (_req, res) => {
       res.setHeader("Cache-Control", "no-store");
@@ -97,7 +120,7 @@ try {
   });
   console.log("\nSupersix Studio");
   console.log(
-    `เปิดเว็บ: ${config.hosted ? config.publicOrigin : `http://127.0.0.1:${config.port}`}`,
+    `เปิดเว็บ: ${config.hosted ? `ผ่านโดเมน HTTPS ของเซิร์ฟเวอร์ (port ${config.port})` : `http://127.0.0.1:${config.port}`}`,
   );
   console.log(`โฟลเดอร์ข้อมูล: ${config.storagePath}`);
   console.log(`ไฟล์ละไม่เกิน: ${config.maxUploadBytes / (1024 * 1024)} MB`);
@@ -106,19 +129,27 @@ try {
   );
   console.log("ปิดโปรแกรม: กด Ctrl+C ในหน้าต่างนี้\n");
 
-  let shuttingDown = false;
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log("\nกำลังปิด Supersix Studio...");
-    const forceExit = setTimeout(() => process.exit(1), 10000);
+    studio.drain();
+    const forceExit = setTimeout(() => {
+      server.closeAllConnections();
+      process.exit(1);
+    }, 25000);
     forceExit.unref();
     // Close HMR sockets before waiting for the parent HTTP server to close.
-    await vite?.close();
+    await vite?.close().catch((error) => console.error("Vite shutdown:", error.code || error.name));
     server.close(async () => {
-      studio.close();
-      clearTimeout(forceExit);
-      process.exit(0);
+      try {
+        await studio.close();
+        clearTimeout(forceExit);
+        process.exit(0);
+      } catch (error) {
+        console.error("Database shutdown:", error.code || error.name);
+        process.exit(1);
+      }
     });
     server.closeIdleConnections();
   };
@@ -127,13 +158,13 @@ try {
 } catch (error) {
   if (error.code === "EADDRINUSE") {
     console.error(
-      "พอร์ตนี้ถูกใช้งานอยู่ ปิด Supersix Studio หน้าต่างเดิม หรือเปลี่ยน PORT ในไฟล์ .env",
+      "พอร์ตนี้ถูกใช้งานอยู่ ปิด Supersix Studio หน้าต่างเดิม หรือใช้ npm start -- --port 10001",
     );
   } else {
     console.error(error.message);
   }
   await vite?.close();
-  studio?.close();
+  await studio?.close();
   server?.close();
   process.exitCode = 1;
 }

@@ -3,24 +3,20 @@ services:
     name: supersix-studio
     runtime: node
     plan: starter
-    buildCommand: npm ci --include=dev && npm run build
+    region: singapore
+    buildCommand: npm ci --include=dev && npm run check
     startCommand: npm start
+    preDeployCommand: npm run db:migrate
     healthCheckPath: /api/health
     envVars:
-      - key: NODE_VERSION
-        value: "24"
-      - key: NODE_ENV
-        value: production
-      - key: APP_MODE
-        value: hosted
       - key: APP_USERNAME
         value: super6
       - key: APP_PASSWORD
-        generateValue: true
-      - key: STORAGE_PATH
-        value: /var/data/supersix-studio
-      - key: MAX_UPLOAD_MB
-        value: "500"
+        value: "1234"
+      - key: DATABASE_URL
+        sync: false
+      - key: DIRECT_URL
+        sync: false
     disk:
       name: supersix-data
       mountPath: /var/data

@@ -5,70 +5,67 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import express from "express";
-import { configurationFrom } from "./config.mjs";
+import { configurationFrom, PROJECT_ROOT } from "./config.mjs";
 import { localRequestGuard } from "./security.mjs";
 import { createStudioApi } from "./api.mjs";
+import { createTestDatabase } from "./test-database.mjs";
 
-const secret = "test-password-long-enough-for-hosting";
+const secret = "1234";
 
-test("Render configuration binds the assigned port and requires credentials and a canonical URL", () => {
-  const config = configurationFrom({
-    RENDER: "true",
-    PORT: "10000",
-    RENDER_EXTERNAL_URL: "https://studio.example",
-    APP_PASSWORD: secret,
-  });
+test("production starts with fixed defaults and only credentials are read from env", () => {
+  const config = configurationFrom({});
   assert.equal(config.host, "0.0.0.0");
   assert.equal(config.port, 10000);
-  assert.equal(config.storagePath, "/var/data/supersix-studio");
-  assert.equal(config.publicOrigin, "https://studio.example");
+  assert.equal(
+    config.storagePath,
+    process.platform === "win32" ? path.join(PROJECT_ROOT, "data") : "/var/data/supersix-studio",
+  );
+  assert.equal(config.maxUploadBytes, 500 * 1024 * 1024);
+  assert.equal(config.hosted, true);
+  assert.equal(config.dev, false);
   assert.equal(config.appUsername, "super6");
-  assert.throws(
-    () => configurationFrom({ RENDER: "true", RENDER_EXTERNAL_URL: "https://studio.example" }),
-    /APP_PASSWORD/,
+  assert.equal(config.appPassword, secret);
+  assert.deepEqual(
+    configurationFrom({
+      APP_MODE: "local",
+      NODE_ENV: "development",
+      RENDER: "false",
+      PORT: "9000",
+      STORAGE_PATH: "ignored",
+      MAX_UPLOAD_MB: "1",
+      PUBLIC_URL: "invalid",
+      RENDER_EXTERNAL_URL: "invalid",
+    }),
+    config,
   );
-  assert.throws(
-    () => configurationFrom({ APP_MODE: "hosted", APP_PASSWORD: secret }),
-    /PUBLIC_URL/,
-  );
-  assert.throws(
-    () =>
-      configurationFrom({
-        APP_MODE: "hosted",
-        APP_PASSWORD: secret,
-        PUBLIC_URL: "http://studio.example",
-      }),
-    /HTTPS/,
-  );
-  assert.throws(
-    () =>
-      configurationFrom({
-        APP_MODE: "hosted",
-        APP_PASSWORD: secret,
-        PUBLIC_URL: "https://studio.example/subpath",
-      }),
-    /HTTPS/,
-  );
-  assert.throws(
-    () =>
-      configurationFrom(
-        { APP_MODE: "hosted", APP_PASSWORD: secret, PUBLIC_URL: "https://studio.example" },
-        ["--dev"],
-      ),
-    /not --dev/,
-  );
-  assert.equal(configurationFrom({}).host, "127.0.0.1");
+  const custom = configurationFrom({ APP_USERNAME: "owner", APP_PASSWORD: "5678" });
+  assert.equal(custom.appUsername, "owner");
+  assert.equal(custom.appPassword, "5678");
+  assert.throws(() => configurationFrom({ APP_USERNAME: "invalid:name" }), /APP_USERNAME/);
+  assert.equal(configurationFrom({}, ["--port", "10001"]).port, 10001);
+  for (const port of ["", "abc", "80", "65536"]) {
+    assert.throws(() => configurationFrom({}, ["--port", port]), /--port/);
+  }
+  const dev = configurationFrom({}, ["--dev"]);
+  assert.equal(dev.host, "127.0.0.1");
+  assert.equal(dev.port, 3000);
+  assert.equal(dev.hosted, false);
+  assert.equal(dev.storagePath, path.join(PROJECT_ROOT, "data"));
 });
 
 test("Hosted requests protect pages, APIs and media while leaving only readiness public", async (t) => {
+  const database = await createTestDatabase();
   const temp = await mkdtemp(path.join(os.tmpdir(), "supersix-hosted-"));
-  const studio = createStudioApi({ storagePath: temp, hosted: true });
+  const studio = await createStudioApi({
+    storagePath: temp,
+    hosted: true,
+    databaseUrl: database.url,
+  });
   const app = express();
   app.use(
     localRequestGuard({
       port: 10000,
       hosted: true,
-      publicOrigin: "https://studio.example",
       appUsername: "super6",
       appPassword: secret,
     }),
@@ -81,7 +78,8 @@ test("Hosted requests protect pages, APIs and media while leaving only readiness
   const port = server.address().port;
   t.after(async () => {
     await new Promise((resolve) => server.close(resolve));
-    studio.close();
+    await studio.close();
+    await database.close();
     await rm(temp, { recursive: true, force: true });
   });
   const authorization = `Basic ${Buffer.from(`super6:${secret}`).toString("base64")}`;
@@ -179,9 +177,44 @@ test("Hosted requests protect pages, APIs and media while leaving only readiness
   assert.equal(
     (
       await request("/api/studio", {
-        headers: { Authorization: authorization, Host: "unrelated.example" },
+        headers: { ...ownHeaders, Host: "unrelated.example" },
       })
     ).status,
     403,
   );
+  for (const headers of [
+    { Origin: "http://studio.example" },
+    { Origin: "null" },
+    { Origin: "https://unrelated.example", "X-Forwarded-Host": "unrelated.example" },
+    { Origin: "http://studio.example", "X-Forwarded-Proto": "http" },
+    { "Sec-Fetch-Site": "cross-site" },
+    { Host: "studio.example/invalid" },
+    { Host: "user@studio.example" },
+  ]) {
+    assert.equal(
+      (await request("/api/studio", { headers: { ...ownHeaders, ...headers } })).status,
+      403,
+    );
+  }
+  for (const [host, origin] of [
+    ["custom.example", "https://custom.example"],
+    ["custom.example:8443", "https://custom.example:8443"],
+    [`127.0.0.1:${port}`, `http://127.0.0.1:${port}`],
+  ]) {
+    assert.equal(
+      (
+        await request("/api/settings", {
+          method: "PATCH",
+          headers: {
+            Authorization: authorization,
+            Host: host,
+            Origin: origin,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ reelEnabled: true }),
+        })
+      ).status,
+      200,
+    );
+  }
 });

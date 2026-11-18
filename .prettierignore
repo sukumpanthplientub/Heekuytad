@@ -1,0 +1,10 @@
+node_modules/
+dist/
+data/
+server/generated/
+package-lock.json
+.env*
+certs/*.crt
+public/fonts/
+# Applied migration SQL must keep its original checksum.
+prisma/migrations/

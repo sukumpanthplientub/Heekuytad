@@ -1,6 +1,18 @@
-import { DatabaseSync } from "node:sqlite";
-import { mkdirSync, realpathSync, existsSync, lstatSync, renameSync } from "node:fs";
+import {
+  mkdirSync,
+  realpathSync,
+  existsSync,
+  lstatSync,
+  renameSync,
+  readdirSync,
+  unlinkSync,
+  statfsSync,
+} from "node:fs";
 import path from "node:path";
+import { createDatabase } from "./database.mjs";
+import { createFileJournal } from "./file-journal.mjs";
+import { databaseOptions } from "./database-url.mjs";
+import { Prisma } from "./generated/prisma/client.ts";
 
 export const SHOP_FOLDERS = Object.freeze({
   supersix: "supersix-shop",
@@ -8,59 +20,50 @@ export const SHOP_FOLDERS = Object.freeze({
   gstation: "g-station",
 });
 
-export function createStorage({ storagePath, maxUploadBytes = 500 * 1024 * 1024 }) {
+export async function createStorage({
+  storagePath,
+  databaseUrl,
+  maxUploadBytes = 500 * 1024 * 1024,
+}) {
   if (!storagePath) throw new Error("storagePath is required");
-  mkdirSync(path.resolve(storagePath), { recursive: true });
-  const root = realpathSync(path.resolve(storagePath));
-  const uploadsPath = path.join(root, "uploads");
-  const temporaryPath = path.join(root, ".uploading");
-  mkdirSync(uploadsPath, { recursive: true });
-  mkdirSync(temporaryPath, { recursive: true });
-  const databasePath = path.join(root, "studio.sqlite");
-  const db = new DatabaseSync(databasePath);
-  // Refuse a newer database before changing pragmas or creating any tables.
-  const versionTable = db
-    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'")
-    .get();
-  if (versionTable) {
-    const knownVersion = db.prepare("SELECT version FROM schema_version").get();
-    if (!knownVersion || knownVersion.version !== 1) {
-      db.close();
-      throw new Error(
-        "Unsupported database version; keep a backup and use the matching app version.",
-      );
+  const db = createDatabase(databaseUrl);
+  const assetsTable = Prisma.raw(`"${databaseOptions(databaseUrl).schema}"."assets"`);
+  let root, uploadsPath, temporaryPath;
+  try {
+    await db.$connect();
+    // Fail at startup if migrations have not been deployed.
+    await Promise.all([
+      db.job.findFirst({ select: { id: true } }),
+      db.asset.findFirst({ select: { id: true } }),
+      db.settings.findFirst({ select: { id: true } }),
+    ]);
+    mkdirSync(path.resolve(storagePath), { recursive: true });
+    root = realpathSync(path.resolve(storagePath));
+    uploadsPath = absolute("uploads");
+    temporaryPath = absolute(".uploading");
+    mkdirSync(uploadsPath, { recursive: true });
+    mkdirSync(temporaryPath, { recursive: true });
+    // No uploads are active before this single-disk server begins listening.
+    for (const entry of readdirSync(temporaryPath, { withFileTypes: true })) {
+      if (
+        entry.isFile() &&
+        /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\.partial$/.test(entry.name)
+      )
+        unlinkSync(absolute(`.uploading/${entry.name}`));
     }
+  } catch (error) {
+    await db.$disconnect();
+    throw error;
   }
-  db.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
-    INSERT INTO schema_version(version) SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
-    CREATE TABLE IF NOT EXISTS jobs (
-      id TEXT PRIMARY KEY, store TEXT NOT NULL, title TEXT NOT NULL,
-      requester TEXT NOT NULL DEFAULT '', brief TEXT NOT NULL DEFAULT '',
-      type TEXT NOT NULL DEFAULT 'image', planned_date TEXT NOT NULL DEFAULT '', due_date TEXT NOT NULL DEFAULT '',
-      priority TEXT NOT NULL DEFAULT 'normal', quantity INTEGER,
-      work_status TEXT NOT NULL DEFAULT 'todo', post_status TEXT NOT NULL DEFAULT 'unposted',
-      post_url TEXT NOT NULL DEFAULT '', post_date TEXT NOT NULL DEFAULT '', post_note TEXT NOT NULL DEFAULT '',
-      reference_url TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-      completed_at TEXT, archived INTEGER NOT NULL DEFAULT 0, deleted_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS assets (
-      id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id), relative_path TEXT NOT NULL UNIQUE,
-      name TEXT NOT NULL, mime_type TEXT NOT NULL, size INTEGER NOT NULL, kind TEXT NOT NULL,
-      created_at TEXT NOT NULL, deleted_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS settings (
-      id INTEGER PRIMARY KEY CHECK(id = 1), reel_anchor TEXT NOT NULL DEFAULT '',
-      reel_enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS jobs_created_idx ON jobs(deleted_at, created_at);
-    CREATE INDEX IF NOT EXISTS assets_job_idx ON assets(job_id, deleted_at);
-  `);
-  const info = { root, rootPath: root, uploadsPath, databasePath, maxUploadBytes };
+  const info = {
+    root,
+    rootPath: root,
+    uploadsPath,
+    databaseProvider: "postgresql",
+    maxUploadBytes,
+  };
 
-  // All stored paths are relative. A moved project/data folder remains portable.
-  // Reject traversal and directory links so media routes cannot expose other files.
+  // Keep every media path beneath the configured disk, including after a shop move.
   function absolute(relative) {
     if (typeof relative !== "string" || relative.includes("\0") || path.isAbsolute(relative))
       throw new Error("Invalid stored path");
@@ -91,53 +94,87 @@ export function createStorage({ storagePath, maxUploadBytes = 500 * 1024 * 1024 
     return location;
   }
 
-  function transaction(action) {
-    db.exec("BEGIN IMMEDIATE");
+  let journal;
+  try {
+    journal = createFileJournal({ db, absolute, jobRelative });
+    await journal.recoverAll();
+  } catch (error) {
+    await db.$disconnect();
+    throw error;
+  }
+
+  // All changes to one job share a transaction-scoped lock. It also works through
+  // Supabase's transaction pooler and prevents a completed upload racing a move.
+  const jobLocks = new Map();
+  async function withJob(id, action) {
+    id = id.toLowerCase();
+    // Keep same-process requests queued until filesystem compensation finishes,
+    // even if PostgreSQL has already released its transaction lock on failure.
+    const previous = jobLocks.get(id) || Promise.resolve();
+    let release;
+    const waiting = new Promise((resolve) => {
+      release = resolve;
+    });
+    jobLocks.set(id, waiting);
+    await previous;
+    const rollback = [];
+    const committed = [];
     try {
-      const result = action();
-      db.exec("COMMIT");
+      const result = await db.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${id}, 0))::text AS locked`;
+        await journal.recoverJob(id, tx);
+        return action(tx, rollback, committed);
+      });
+      // Cleanup errors must never roll back files after a successful DB commit.
+      for (const finish of committed) {
+        try {
+          finish();
+        } catch (error) {
+          console.error("Media journal cleanup deferred:", error.code || error.name);
+        }
+      }
       return result;
     } catch (error) {
-      db.exec("ROLLBACK");
+      for (const undo of rollback.reverse()) {
+        try {
+          undo();
+        } catch (undoError) {
+          console.error("Media rollback failed:", undoError.code || "filesystem error");
+        }
+      }
       throw error;
+    } finally {
+      release();
+      if (jobLocks.get(id) === waiting) jobLocks.delete(id);
     }
   }
 
-  // Metadata and physical folders follow a shop change together. Same data root
-  // guarantees rename stays on one filesystem; rollback puts the folder back.
-  function moveJobShop(job, nextStore, updateMetadata) {
-    if (job.store === nextStore) return transaction(updateMetadata);
+  // Called only while holding withJob's lock. Compensate the filesystem rename
+  // if any SQL statement or the transaction commit fails.
+  async function moveJobShop(tx, job, nextStore, rollback, committed = []) {
+    if (job.store === nextStore) return;
     const oldRelative = jobRelative(job);
     const nextRelative = jobRelative(job, nextStore);
     const oldFolder = absolute(oldRelative);
     const nextFolder = absolute(nextRelative);
-    let moved = false;
-    try {
-      if (existsSync(oldFolder)) {
-        mkdirSync(path.dirname(nextFolder), { recursive: true });
-        if (existsSync(nextFolder)) throw new Error("Destination job folder already exists");
-        renameSync(oldFolder, nextFolder);
-        moved = true;
-      }
-      return transaction(() => {
-        const assets = db
-          .prepare("SELECT id, relative_path FROM assets WHERE job_id = ?")
-          .all(job.id);
-        for (const asset of assets) {
-          if (!asset.relative_path.startsWith(`${oldRelative}/`))
-            throw new Error("Unexpected stored asset path");
-          const destination = nextRelative + asset.relative_path.slice(oldRelative.length);
-          db.prepare("UPDATE assets SET relative_path = ? WHERE id = ?").run(destination, asset.id);
-        }
-        return updateMetadata();
-      });
-    } catch (error) {
-      if (moved) renameSync(nextFolder, oldFolder);
-      throw error;
+    if (existsSync(oldFolder)) {
+      mkdirSync(path.dirname(nextFolder), { recursive: true });
+      if (existsSync(nextFolder)) throw new Error("Destination job folder already exists");
+      committed.push(journal.begin(job, nextStore));
+      renameSync(oldFolder, nextFolder);
+      rollback.push(() => renameSync(nextFolder, oldFolder));
     }
+    const unexpected = await tx.asset.findFirst({
+      where: { job_id: job.id, NOT: { relative_path: { startsWith: `${oldRelative}/` } } },
+      select: { id: true },
+    });
+    if (unexpected) throw new Error("Unexpected stored asset path");
+    // One parameterized update instead of a network round trip for every asset.
+    await tx.$executeRaw`UPDATE ${assetsTable}
+      SET relative_path = ${nextRelative} || substring(relative_path from ${oldRelative.length + 1}::int)
+      WHERE job_id = ${job.id}::uuid`;
   }
 
-  let closed = false;
   return {
     db,
     info,
@@ -147,13 +184,21 @@ export function createStorage({ storagePath, maxUploadBytes = 500 * 1024 * 1024 
     absolute,
     jobRelative,
     jobFolder,
-    transaction,
+    withJob,
     moveJobShop,
-    close() {
-      if (closed) return;
-      db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
-      db.close();
-      closed = true;
+    checkUploadSpace(bytes) {
+      const disk = statfsSync(temporaryPath);
+      if (disk.bavail * disk.bsize < bytes + 16 * 1024 * 1024) {
+        const error = new Error("Not enough disk space for upload");
+        error.code = "ENOSPC";
+        throw error;
+      }
+    },
+    async health() {
+      await db.$queryRaw`SELECT 1`;
+    },
+    async close() {
+      await db.$disconnect();
     },
   };
 }

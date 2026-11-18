@@ -44,7 +44,7 @@ export interface StorageInfo {
   canOpenFolder: boolean;
   rootPath: string;
   uploadsPath: string;
-  databasePath: string;
+  databaseProvider: "postgresql";
   maxUploadBytes: number;
 }
 export interface StudioData {

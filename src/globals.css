@@ -4876,6 +4876,11 @@ button.btn-danger {
   color: #b4d19d;
   font-size: 13px;
 }
+.load-more-jobs {
+  display: flex;
+  justify-content: center;
+  padding: 24px 0;
+}
 .trash-body {
   min-height: 170px;
 }

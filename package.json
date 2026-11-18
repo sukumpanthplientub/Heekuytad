@@ -3,32 +3,53 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Personal creative job tracker with SQLite and file uploads; ready for a Render persistent disk.",
+  "description": "Personal creative job tracker with Supabase PostgreSQL, Prisma migrations and file uploads.",
   "engines": {
     "node": ">=24.0.0 <25"
   },
   "scripts": {
     "dev": "node server/index.mjs --dev",
     "start": "node server/index.mjs",
-    "build": "tsc --noEmit && vite build",
+    "build": "prisma generate && tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
-    "test": "node --test server/*.test.mjs",
-    "format": "prettier --write src server index.html vite.config.ts tsconfig.json package.json README.md"
+    "test": "node --test --test-concurrency=1 server/*.test.mjs",
+    "format": "prettier --write . && prisma format",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate deploy",
+    "db:status": "prisma migrate status",
+    "db:dev": "prisma migrate dev",
+    "db:check": "node scripts/check-database.mjs",
+    "predev": "prisma generate",
+    "pretest": "prisma generate",
+    "db:import-sqlite": "node scripts/import-sqlite.mjs",
+    "lint": "eslint . --max-warnings 0",
+    "lint:fix": "npm run lint -- --fix",
+    "format:check": "prettier --check .",
+    "check": "npm run format:check && npm run lint && npm run build"
   },
   "dependencies": {
+    "@prisma/adapter-pg": "7.10.1",
+    "@prisma/client": "7.10.1",
     "busboy": "1.6.0",
     "express": "5.3.0",
     "lucide-react": "1.31.0",
+    "pg": "8.23.1",
+    "prisma": "7.10.1",
     "react": "19.2.6",
     "react-dom": "19.2.6"
   },
   "devDependencies": {
+    "@eslint/js": "10.0.1",
     "@types/node": "24.10.13",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.0.2",
+    "eslint": "10.15.0",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "globals": "17.14.0",
     "prettier": "3.8.3",
     "typescript": "5.9.3",
+    "typescript-eslint": "8.73.0",
     "vite": "8.0.13"
   }
 }

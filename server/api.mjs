@@ -17,6 +17,8 @@ import { spawn } from "node:child_process";
 import { createStorage } from "./storage.mjs";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// eslint-disable-next-line no-control-regex -- Filename sanitizers must explicitly remove control characters.
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/g;
 const MIME_TYPES = {
   "image/jpeg": { kind: "image", extension: "jpg" },
   "image/png": { kind: "image", extension: "png" },
@@ -49,7 +51,7 @@ export class ApiError extends Error {
 const now = () => new Date().toISOString();
 function validId(id) {
   if (typeof id !== "string" || !UUID.test(id)) throw new ApiError(400, "รหัสรายการไม่ถูกต้อง");
-  return id;
+  return id.toLowerCase();
 }
 function text(value, label, max, required = false) {
   if (typeof value !== "string") throw new ApiError(400, `${label}ไม่ถูกต้อง`);
@@ -119,7 +121,7 @@ const FIELDS = {
     "archived",
     (v) => {
       if (typeof v !== "boolean") throw new ApiError(400, "สถานะเก็บงานไม่ถูกต้อง");
-      return v ? 1 : 0;
+      return v;
     },
   ],
 };
@@ -208,7 +210,8 @@ function safeBase(name) {
   const basename = path.win32.basename(path.posix.basename(String(name || "file")));
   let result = path
     .parse(basename)
-    .name.replace(/[\u0000-\u001f\u007f<>:"/\\|?*]/g, "_")
+    .name.replace(CONTROL_CHARACTERS, "_")
+    .replace(/[<>:"/\\|?*]/g, "_")
     .replace(/[. ]+$/g, "")
     .trim();
   result = Array.from(result).slice(0, 64).join("") || "file";
@@ -251,11 +254,13 @@ async function openFolder(location) {
 }
 
 /** Mount at /api after the entrypoint's authentication and origin guards. */
-export function createStudioApi(options) {
-  const storage = createStorage(options);
-  const { db, info, absolute, transaction } = storage;
+export async function createStudioApi(options) {
+  const storage = await createStorage(options);
+  const { db, info, absolute, withJob } = storage;
   info.mode = options.hosted ? "hosted" : "local";
   info.canOpenFolder = !options.hosted;
+  const uploads = new Set();
+  let draining = false;
   const router = express.Router();
   router.use((_req, res, next) => {
     res.set({
@@ -266,55 +271,56 @@ export function createStudioApi(options) {
     next();
   });
   router.use(express.json({ limit: "256kb" }));
-  const jobRow = (id, includeDeleted = false) => {
-    validId(id);
-    const row = db
-      .prepare(`SELECT * FROM jobs WHERE id = ?${includeDeleted ? "" : " AND deleted_at IS NULL"}`)
-      .get(id);
+  const jobRow = async (id, includeDeleted = false, client = db) => {
+    const row = await client.job.findFirst({
+      where: { id: validId(id), ...(!includeDeleted ? { deleted_at: null } : {}) },
+    });
     if (!row) throw new ApiError(404, "ไม่พบงานนี้");
     return row;
   };
-  const assetRow = (id, includeDeleted = false) => {
-    validId(id);
-    const row = db
-      .prepare(
-        `SELECT assets.* FROM assets JOIN jobs ON jobs.id = assets.job_id WHERE assets.id = ?${includeDeleted ? "" : " AND assets.deleted_at IS NULL AND jobs.deleted_at IS NULL"}`,
-      )
-      .get(id);
+  const assetRow = async (id, includeDeleted = false, client = db) => {
+    const row = await client.asset.findFirst({
+      where: {
+        id: validId(id),
+        ...(!includeDeleted ? { deleted_at: null, job: { deleted_at: null } } : {}),
+      },
+    });
     if (!row) throw new ApiError(404, "ไม่พบไฟล์นี้");
     return row;
   };
-  const assetsFor = (id) =>
-    db
-      .prepare(
-        "SELECT * FROM assets WHERE job_id = ? AND deleted_at IS NULL ORDER BY created_at, id",
-      )
-      .all(id)
-      .map(mapAsset);
-  const fullJob = (id, includeDeleted = false) => mapJob(jobRow(id, includeDeleted), assetsFor(id));
-  const settings = () => {
-    const row = db.prepare("SELECT * FROM settings WHERE id = 1").get();
+  const activeAssets = {
+    where: { deleted_at: null },
+    orderBy: [{ created_at: "asc" }, { id: "asc" }],
+  };
+  const fullJob = async (id, includeDeleted = false, client = db) => {
+    const row = await client.job.findFirst({
+      where: { id: validId(id), ...(!includeDeleted ? { deleted_at: null } : {}) },
+      include: { assets: activeAssets },
+    });
+    if (!row) throw new ApiError(404, "ไม่พบงานนี้");
+    return mapJob(row, row.assets.map(mapAsset));
+  };
+  const settings = async (client = db) => {
+    const row = await client.settings.findUnique({ where: { id: 1 } });
     return row
-      ? { reelAnchor: row.reel_anchor, reelEnabled: !!row.reel_enabled }
+      ? { reelAnchor: row.reel_anchor, reelEnabled: row.reel_enabled }
       : { reelAnchor: "", reelEnabled: true };
   };
 
-  router.get("/studio", (_req, res) => {
-    const grouped = new Map();
-    for (const row of db
-      .prepare(
-        "SELECT assets.* FROM assets JOIN jobs ON jobs.id = assets.job_id WHERE assets.deleted_at IS NULL AND jobs.deleted_at IS NULL ORDER BY assets.created_at, assets.id",
-      )
-      .all()) {
-      const entries = grouped.get(row.job_id) || [];
-      entries.push(mapAsset(row));
-      grouped.set(row.job_id, entries);
-    }
-    const jobs = db
-      .prepare("SELECT * FROM jobs WHERE deleted_at IS NULL ORDER BY created_at DESC, id DESC")
-      .all()
-      .map((row) => mapJob(row, grouped.get(row.id) || []));
-    res.json({ jobs, settings: settings(), storage: info });
+  router.get("/studio", async (_req, res) => {
+    const [rows, currentSettings] = await Promise.all([
+      db.job.findMany({
+        where: { deleted_at: null },
+        orderBy: [{ created_at: "desc" }, { id: "desc" }],
+        include: { assets: activeAssets },
+      }),
+      settings(),
+    ]);
+    res.json({
+      jobs: rows.map((row) => mapJob(row, row.assets.map(mapAsset))),
+      settings: currentSettings,
+      storage: info,
+    });
   });
   router.get("/storage", (_req, res) => res.json(info));
   router.post("/storage/open", async (_req, res) => {
@@ -323,7 +329,7 @@ export function createStudioApi(options) {
     res.json(await openFolder(storage.root));
   });
 
-  router.post("/jobs", (req, res) => {
+  router.post("/jobs", async (req, res) => {
     const input = { ...jsonBody(req) };
     const id = input.id === undefined ? randomUUID() : validId(input.id);
     delete input.id;
@@ -341,87 +347,86 @@ export function createStudioApi(options) {
     };
     for (const key of Object.keys(input))
       if (!Object.hasOwn(defaults, key))
-        throw new ApiError(400, `ไม่รองรับข้อมูลช่อง ${key.slice(0, 50)}`);
+        throw new ApiError(400, "ไม่รองรับข้อมูลช่อง " + key.slice(0, 50));
     const values = validatedPatch({ ...defaults, ...input });
-    const existing = db.prepare("SELECT deleted_at FROM jobs WHERE id = ?").get(id);
-    if (existing) {
-      if (existing.deleted_at)
+    const result = await withJob(id, async (tx) => {
+      const existing = await tx.job.findUnique({ where: { id } });
+      if (existing?.deleted_at)
         throw new ApiError(409, "รหัสนี้เป็นงานในถังขยะ กรุณากู้คืนหรือสร้างงานใหม่");
-      return res.json({ job: fullJob(id) });
-    }
-    const columns = Object.keys(values);
-    const timestamp = now();
-    db.prepare(
-      `INSERT INTO jobs(id,${columns.join(",")},created_at,updated_at) VALUES (${Array(
-        columns.length + 3,
-      )
-        .fill("?")
-        .join(",")})`,
-    ).run(id, ...Object.values(values), timestamp, timestamp);
-    res.status(201).json({ job: fullJob(id) });
+      if (!existing) await tx.job.create({ data: { id, ...values } });
+      return { created: !existing, job: await fullJob(id, false, tx) };
+    });
+    res.status(result.created ? 201 : 200).json({ job: result.job });
   });
-  router.patch("/jobs/:id", (req, res) => {
-    const current = jobRow(req.params.id);
+  router.patch("/jobs/:id", async (req, res) => {
+    const id = validId(req.params.id);
     const patch = validatedPatch(jsonBody(req));
-    const timestamp = now();
-    if ("work_status" in patch)
-      patch.completed_at = patch.work_status === "done" ? current.completed_at || timestamp : null;
-    patch.updated_at = timestamp;
-    const apply = () =>
-      db
-        .prepare(
-          `UPDATE jobs SET ${Object.keys(patch)
-            .map((column) => `${column} = ?`)
-            .join(",")} WHERE id = ?`,
-        )
-        .run(...Object.values(patch), current.id);
-    if (patch.store && patch.store !== current.store)
-      storage.moveJobShop(current, patch.store, apply);
-    else transaction(apply);
-    res.json({ job: fullJob(current.id) });
+    const job = await withJob(id, async (tx, rollback, committed) => {
+      const current = await jobRow(id, false, tx);
+      const timestamp = now();
+      if ("work_status" in patch)
+        patch.completed_at =
+          patch.work_status === "done" ? current.completed_at || timestamp : null;
+      patch.updated_at = timestamp;
+      if (patch.store) await storage.moveJobShop(tx, current, patch.store, rollback, committed);
+      await tx.job.update({ where: { id }, data: patch });
+      return fullJob(id, false, tx);
+    });
+    res.json({ job });
   });
-  router.delete("/jobs/:id", (req, res) => {
-    const row = jobRow(req.params.id);
-    db.prepare("UPDATE jobs SET deleted_at = ?, updated_at = ? WHERE id = ?").run(
-      now(),
-      now(),
-      row.id,
-    );
+  router.delete("/jobs/:id", async (req, res) => {
+    const id = validId(req.params.id);
+    await withJob(id, async (tx) => {
+      await jobRow(id, false, tx);
+      await tx.job.update({ where: { id }, data: { deleted_at: now() } });
+    });
     res.json({ ok: true });
   });
-  router.post("/jobs/:id/restore", (req, res) => {
-    const row = jobRow(req.params.id, true);
-    db.prepare("UPDATE jobs SET deleted_at = NULL, updated_at = ? WHERE id = ?").run(now(), row.id);
-    res.json({ job: fullJob(row.id) });
+  router.post("/jobs/:id/restore", async (req, res) => {
+    const id = validId(req.params.id);
+    const job = await withJob(id, async (tx) => {
+      await jobRow(id, true, tx);
+      await tx.job.update({ where: { id }, data: { deleted_at: null } });
+      return fullJob(id, false, tx);
+    });
+    res.json({ job });
   });
   router.post("/jobs/:id/folder", async (req, res) => {
     if (options.hosted)
       throw new ApiError(409, "ไฟล์อยู่บนเซิร์ฟเวอร์ ใช้ปุ่มดาวน์โหลดเพื่อบันทึกลงเครื่องของคุณ");
-    const row = jobRow(req.params.id);
+    const row = await jobRow(req.params.id);
     res.json(await openFolder(storage.jobFolder(row, true)));
   });
 
-  router.get("/trash", (_req, res) => {
-    const jobs = db
-      .prepare("SELECT * FROM jobs WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC")
-      .all()
-      .map((row) => mapJob(row, assetsFor(row.id)));
-    const assets = db
-      .prepare(
-        "SELECT assets.*, jobs.title AS job_title FROM assets JOIN jobs ON jobs.id = assets.job_id WHERE assets.deleted_at IS NOT NULL AND jobs.deleted_at IS NULL ORDER BY assets.deleted_at DESC",
-      )
-      .all()
-      .map((row) => ({ ...mapAsset(row), jobTitle: row.job_title }));
-    res.json({ jobs, assets });
+  router.get("/trash", async (_req, res) => {
+    const [jobs, assets] = await Promise.all([
+      db.job.findMany({
+        where: { deleted_at: { not: null } },
+        orderBy: { deleted_at: "desc" },
+        include: { assets: activeAssets },
+      }),
+      db.asset.findMany({
+        where: { deleted_at: { not: null }, job: { deleted_at: null } },
+        orderBy: { deleted_at: "desc" },
+        include: { job: { select: { title: true } } },
+      }),
+    ]);
+    res.json({
+      jobs: jobs.map((row) => mapJob(row, row.assets.map(mapAsset))),
+      assets: assets.map((row) => ({ ...mapAsset(row), jobTitle: row.job.title })),
+    });
   });
 
-  router.post("/jobs/:id/assets", async (req, res) => {
-    jobRow(req.params.id);
+  async function receiveUpload(req, res, controller) {
+    await jobRow(req.params.id);
+    if (controller.signal.aborted) throw controller.signal.reason;
+    if (req.aborted) throw new ApiError(400, "การอัปโหลดถูกยกเลิก");
     const maxBytes = info.maxUploadBytes;
     const maxLabel = Math.round(maxBytes / 1024 / 1024);
     if (!req.is("multipart/form-data")) throw new ApiError(415, "กรุณาเลือกไฟล์จากปุ่มอัปโหลด");
     if (Number(req.headers["content-length"] || 0) > maxBytes + 128 * 1024)
       throw new ApiError(413, `ไฟล์ต้องมีขนาดไม่เกิน ${maxLabel} MB`);
+    storage.checkUploadSpace(Math.min(Number(req.headers["content-length"]) || maxBytes, maxBytes));
     const id = randomUUID();
     const temporaryFile = path.join(storage.temporaryPath, `${id}.partial`);
     let fileName = "";
@@ -442,7 +447,9 @@ export function createStudioApi(options) {
     } catch {
       throw new ApiError(400, "ข้อมูลอัปโหลดไม่ถูกต้อง");
     }
-    const onAborted = () => parser.destroy(new ApiError(400, "การอัปโหลดถูกยกเลิก"));
+    const onAborted = () => controller.abort(new ApiError(400, "การอัปโหลดถูกยกเลิก"));
+    const cancelParser = () => parser.destroy(controller.signal.reason);
+    controller.signal.addEventListener("abort", cancelParser, { once: true });
     req.once("aborted", onAborted);
     try {
       await new Promise((resolve, reject) => {
@@ -467,7 +474,7 @@ export function createStudioApi(options) {
           fileName =
             path.win32
               .basename(path.posix.basename(metadata.filename || "file"))
-              .replace(/[\u0000-\u001f\u007f]/g, "")
+              .replace(CONTROL_CHARACTERS, "")
               .slice(0, 240) || "file";
           mimeType = metadata.mimeType;
           if (mimeType === "application/octet-stream")
@@ -483,62 +490,89 @@ export function createStudioApi(options) {
           const counter = new Transform({
             transform(chunk, _encoding, callback) {
               bytes += chunk.length;
+              if (bytes > maxBytes)
+                return callback(new ApiError(413, `ไฟล์ต้องมีขนาดไม่เกิน ${maxLabel} MB`));
               if (header.length < 64)
                 header = Buffer.concat([header, chunk.subarray(0, 64 - header.length)]);
               callback(null, chunk);
             },
           });
           writes.push(
-            pipeline(stream, counter, createWriteStream(temporaryFile, { flags: "wx" })).catch(
-              (error) => {
-                fileError ||= error;
-                parser.destroy(error);
-              },
-            ),
+            pipeline(stream, counter, createWriteStream(temporaryFile, { flags: "wx" }), {
+              signal: controller.signal,
+            }).catch((error) => {
+              fileError ||= error;
+              parser.destroy(error);
+            }),
           );
         });
         req.pipe(parser);
       });
       await Promise.all(writes);
+      if (controller.signal.aborted) throw controller.signal.reason;
       if (fileError) throw fileError;
       if (bytes > maxBytes) throw new ApiError(413, `ไฟล์ต้องมีขนาดไม่เกิน ${maxLabel} MB`);
       if (!seen || !bytes) throw new ApiError(400, "ไฟล์นี้ไม่มีข้อมูล");
       if (!validHeader(header, mimeType))
         throw new ApiError(415, "เนื้อหาไฟล์ไม่ตรงกับชนิดรูปหรือวิดีโอ กรุณาเลือกไฟล์ใหม่");
-      // Re-read after streaming: a second browser tab may have moved/removed the job.
-      const job = jobRow(req.params.id);
-      const type = MIME_TYPES[mimeType];
-      const relativePath = path.posix.join(
-        storage.jobRelative(job),
-        type.kind === "image" ? "images" : "videos",
-        `${safeBase(fileName)}_${id}.${type.extension}`,
-      );
-      const destination = absolute(relativePath);
-      mkdirSync(path.dirname(destination), { recursive: true });
-      renameSync(temporaryFile, destination);
-      const timestamp = now();
-      try {
-        transaction(() => {
-          db.prepare(
-            "INSERT INTO assets(id,job_id,relative_path,name,mime_type,size,kind,created_at) VALUES (?,?,?,?,?,?,?,?)",
-          ).run(id, job.id, relativePath, fileName, mimeType, bytes, type.kind, timestamp);
-          db.prepare("UPDATE jobs SET updated_at = ? WHERE id = ?").run(timestamp, job.id);
+      // Take the job lock only after streaming, so other tabs can edit during upload.
+      const asset = await withJob(req.params.id, async (tx, rollback) => {
+        const job = await jobRow(req.params.id, false, tx);
+        const type = MIME_TYPES[mimeType];
+        const relativePath = path.posix.join(
+          storage.jobRelative(job),
+          type.kind === "image" ? "images" : "videos",
+          safeBase(fileName) + "_" + id + "." + type.extension,
+        );
+        const destination = absolute(relativePath);
+        mkdirSync(path.dirname(destination), { recursive: true });
+        renameSync(temporaryFile, destination);
+        rollback.push(() => {
+          if (existsSync(destination)) unlinkSync(destination);
         });
-      } catch (error) {
-        unlinkSync(destination);
-        throw error;
-      }
+        const row = await tx.asset.create({
+          data: {
+            id,
+            job_id: job.id,
+            relative_path: relativePath,
+            name: fileName,
+            mime_type: mimeType,
+            size: bytes,
+            kind: type.kind,
+          },
+        });
+        await tx.job.update({ where: { id: job.id }, data: { updated_at: now() } });
+        return mapAsset(row);
+      });
       completed = true;
-      res.status(201).json({ asset: mapAsset(assetRow(id)) });
+      res.status(201).json({ asset });
     } finally {
       req.off("aborted", onAborted);
+      controller.signal.removeEventListener("abort", cancelParser);
+      req.unpipe(parser);
+      if (!req.complete && !res.headersSent) res.setHeader("Connection", "close");
       await Promise.allSettled(writes);
       if (!completed && existsSync(temporaryFile)) unlinkSync(temporaryFile);
+    }
+  }
+
+  router.post("/jobs/:id/assets", async (req, res) => {
+    if (draining) throw new ApiError(503, "ระบบกำลังเริ่มใหม่ กรุณาลองอัปโหลดอีกครั้ง");
+    if (uploads.size >= 2) {
+      res.setHeader("Retry-After", "3");
+      throw new ApiError(429, "มีไฟล์กำลังอัปโหลดอยู่ กรุณารอสักครู่แล้วลองอีกครั้ง");
+    }
+    const controller = new AbortController();
+    uploads.add(controller);
+    try {
+      await receiveUpload(req, res, controller);
+    } finally {
+      uploads.delete(controller);
     }
   });
 
   router.get("/assets/:id", async (req, res) => {
-    const row = assetRow(req.params.id);
+    const row = await assetRow(req.params.id);
     const location = absolute(row.relative_path);
     let file;
     try {
@@ -596,64 +630,83 @@ export function createStudioApi(options) {
       if (!res.destroyed) throw error;
     }
   });
-  router.delete("/assets/:id", (req, res) => {
-    const row = assetRow(req.params.id);
-    transaction(() => {
-      db.prepare("UPDATE assets SET deleted_at = ? WHERE id = ?").run(now(), row.id);
-      db.prepare("UPDATE jobs SET updated_at = ? WHERE id = ?").run(now(), row.job_id);
+  router.delete("/assets/:id", async (req, res) => {
+    const initial = await assetRow(req.params.id);
+    await withJob(initial.job_id, async (tx) => {
+      const row = await assetRow(req.params.id, false, tx);
+      await tx.asset.update({ where: { id: row.id }, data: { deleted_at: now() } });
+      await tx.job.update({ where: { id: row.job_id }, data: { updated_at: now() } });
     });
     res.json({ ok: true });
   });
-  router.post("/assets/:id/restore", (req, res) => {
-    const row = assetRow(req.params.id, true);
-    jobRow(row.job_id);
-    transaction(() => {
-      db.prepare("UPDATE assets SET deleted_at = NULL WHERE id = ?").run(row.id);
-      db.prepare("UPDATE jobs SET updated_at = ? WHERE id = ?").run(now(), row.job_id);
+  router.post("/assets/:id/restore", async (req, res) => {
+    const initial = await assetRow(req.params.id, true);
+    const asset = await withJob(initial.job_id, async (tx) => {
+      const row = await assetRow(req.params.id, true, tx);
+      await jobRow(row.job_id, false, tx);
+      const restored = await tx.asset.update({ where: { id: row.id }, data: { deleted_at: null } });
+      await tx.job.update({ where: { id: row.job_id }, data: { updated_at: now() } });
+      return mapAsset(restored);
     });
-    res.json({ asset: mapAsset(assetRow(row.id)) });
+    res.json({ asset });
   });
 
-  router.patch("/settings", (req, res) => {
+  router.patch("/settings", async (req, res) => {
     const input = jsonBody(req);
-    const current = settings();
     if (
       !Object.keys(input).length ||
       Object.keys(input).some((key) => !["reelAnchor", "reelEnabled"].includes(key))
     )
       throw new ApiError(400, "ข้อมูลการตั้งค่าไม่ถูกต้อง");
-    if ("reelAnchor" in input) current.reelAnchor = date(input.reelAnchor, "วันเริ่มรอบ Reel");
+    const patch = {};
+    if ("reelAnchor" in input) patch.reel_anchor = date(input.reelAnchor, "วันเริ่มรอบ Reel");
     if ("reelEnabled" in input) {
       if (typeof input.reelEnabled !== "boolean")
         throw new ApiError(400, "การตั้งค่ารอบ Reel ไม่ถูกต้อง");
-      current.reelEnabled = input.reelEnabled;
+      patch.reel_enabled = input.reelEnabled;
     }
-    db.prepare(
-      "INSERT INTO settings(id,reel_anchor,reel_enabled,updated_at) VALUES (1,?,?,?) ON CONFLICT(id) DO UPDATE SET reel_anchor=excluded.reel_anchor,reel_enabled=excluded.reel_enabled,updated_at=excluded.updated_at",
-    ).run(current.reelAnchor, current.reelEnabled ? 1 : 0, now());
-    res.json({ settings: current });
+    const row = await db.settings.upsert({
+      where: { id: 1 },
+      create: { id: 1, ...patch },
+      update: patch,
+    });
+    res.json({ settings: { reelAnchor: row.reel_anchor, reelEnabled: row.reel_enabled } });
   });
   router.use((_req, _res, next) => next(new ApiError(404, "ไม่พบคำสั่งนี้")));
   router.use((error, _req, res, _next) => {
-    if (res.headersSent) return res.end();
+    if (res.headersSent || res.destroyed) return res.end();
     const status =
-      error instanceof ApiError
-        ? error.status
-        : error.type === "entity.too.large"
-          ? 413
-          : error.type === "entity.parse.failed"
-            ? 400
-            : 500;
-    if (status === 500) console.error("Studio API:", error.message);
+      error.code === "ENOSPC"
+        ? 507
+        : error instanceof ApiError
+          ? error.status
+          : error.type === "entity.too.large"
+            ? 413
+            : error.type === "entity.parse.failed"
+              ? 400
+              : 500;
+    if (status === 500) console.error("Studio API:", error.code || error.name);
     const message =
-      error instanceof ApiError
-        ? error.message
-        : status === 413
-          ? "รายละเอียดงานยาวเกินไป"
-          : status === 400
-            ? "รูปแบบข้อมูลไม่ถูกต้อง"
-            : "บันทึกหรือโหลดข้อมูลไม่สำเร็จ ตรวจว่าโฟลเดอร์มีสิทธิ์เขียนและพื้นที่ว่างเพียงพอ";
+      status === 507
+        ? "พื้นที่เก็บไฟล์บนเซิร์ฟเวอร์ไม่เพียงพอ กรุณาเพิ่มพื้นที่แล้วลองอีกครั้ง"
+        : error instanceof ApiError
+          ? error.message
+          : status === 413
+            ? "รายละเอียดงานยาวเกินไป"
+            : status === 400
+              ? "รูปแบบข้อมูลไม่ถูกต้อง"
+              : "บันทึกหรือโหลดข้อมูลไม่สำเร็จ ตรวจการเชื่อมต่อฐานข้อมูลและพื้นที่เก็บไฟล์";
     res.status(status).json({ error: message });
   });
-  return { router, storageInfo: info, close: () => storage.close() };
+  return {
+    router,
+    storageInfo: info,
+    health: () => storage.health(),
+    drain() {
+      draining = true;
+      for (const controller of uploads)
+        controller.abort(new ApiError(503, "ระบบกำลังเริ่มใหม่ กรุณาลองอัปโหลดอีกครั้ง"));
+    },
+    close: () => storage.close(),
+  };
 }

@@ -1,0 +1,64 @@
+generator client {
+  provider               = "prisma-client"
+  output                 = "../server/generated/prisma"
+  moduleFormat           = "esm"
+  generatedFileExtension = "ts"
+  importFileExtension    = "ts"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Job {
+  id            String    @id @default(uuid()) @db.Uuid
+  store         String    @default("supersix")
+  title         String
+  requester     String    @default("")
+  brief         String    @default("")
+  type          String    @default("image")
+  planned_date  String    @default("")
+  due_date      String    @default("")
+  priority      String    @default("normal")
+  quantity      Int?
+  work_status   String    @default("todo")
+  post_status   String    @default("unposted")
+  post_url      String    @default("")
+  post_date     String    @default("")
+  post_note     String    @default("")
+  reference_url String    @default("")
+  created_at    DateTime  @default(now()) @db.Timestamptz(3)
+  updated_at    DateTime  @updatedAt @db.Timestamptz(3)
+  completed_at  DateTime? @db.Timestamptz(3)
+  archived      Boolean   @default(false)
+  deleted_at    DateTime? @db.Timestamptz(3)
+  assets        Asset[]
+
+  @@index([deleted_at, created_at], map: "jobs_created_idx")
+  @@map("jobs")
+}
+
+model Asset {
+  id            String    @id @default(uuid()) @db.Uuid
+  job_id        String    @db.Uuid
+  relative_path String    @unique
+  name          String
+  mime_type     String
+  size          Int
+  kind          String
+  created_at    DateTime  @default(now()) @db.Timestamptz(3)
+  deleted_at    DateTime? @db.Timestamptz(3)
+  job           Job       @relation(fields: [job_id], references: [id], onDelete: Restrict)
+
+  @@index([job_id, deleted_at], map: "assets_job_idx")
+  @@map("assets")
+}
+
+model Settings {
+  id           Int      @id @default(1)
+  reel_anchor  String   @default("")
+  reel_enabled Boolean  @default(true)
+  updated_at   DateTime @updatedAt @db.Timestamptz(3)
+
+  @@map("settings")
+}

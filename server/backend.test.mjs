@@ -7,6 +7,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { request as httpRequest } from "node:http";
 import { createStudioApi } from "./api.mjs";
+import { createTestDatabase } from "./test-database.mjs";
 
 const PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1XkAAAAASUVORK5CYII=",
@@ -18,8 +19,8 @@ const VIDEO = Buffer.concat([
   Buffer.alloc(64, 9),
 ]);
 
-async function start(storagePath, maxUploadBytes = 1024 * 1024) {
-  const api = createStudioApi({ storagePath, maxUploadBytes });
+async function start(storagePath, maxUploadBytes = 1024 * 1024, databaseUrl) {
+  const api = await createStudioApi({ storagePath, maxUploadBytes, databaseUrl });
   const app = express();
   app.use("/api", api.router);
   const server = await new Promise((resolve) => {
@@ -28,6 +29,7 @@ async function start(storagePath, maxUploadBytes = 1024 * 1024) {
   const base = `http://127.0.0.1:${server.address().port}/api`;
   return {
     base,
+    drain: () => api.drain(),
     async request(route, method = "GET", body) {
       const response = await fetch(base + route, {
         method,
@@ -45,20 +47,23 @@ async function start(storagePath, maxUploadBytes = 1024 * 1024) {
       return { response, data: await response.json() };
     },
     async stop() {
+      api.drain();
       await new Promise((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
         server.closeIdleConnections();
       });
-      api.close();
+      await api.close();
     },
   };
 }
 
-test("Local API writes real media folders, persists across restart, and recovers deleted work", async (t) => {
+test("PostgreSQL API writes real media folders, persists across restart, and recovers deleted work", async (t) => {
+  const database = await createTestDatabase();
   const directory = await mkdtemp(path.join(tmpdir(), "supersix-backend-"));
-  let app = await start(directory);
+  let app = await start(directory, undefined, database.url);
   t.after(async () => {
     await app.stop();
+    await database.close();
     await rm(directory, { recursive: true, force: true });
   });
   const id = randomUUID();
@@ -72,9 +77,14 @@ test("Local API writes real media folders, persists across restart, and recovers
     assert.deepEqual(data.settings, { reelAnchor: "", reelEnabled: true });
     assert.equal(data.storage.root, directory);
     assert.equal(data.storage.rootPath, directory);
-    assert.equal(data.storage.databasePath, path.join(directory, "studio.sqlite"));
+    assert.equal(data.storage.databaseProvider, "postgresql");
+    assert.equal("databaseUrl" in data.storage, false);
   });
   await t.test("job creation is retry-safe and rejects invalid business data", async () => {
+    const invalid = await app.request("/jobs", "POST", { title: "ทดสอบ", unsupported: true });
+    assert.equal(invalid.data.error, "ไม่รองรับข้อมูลช่อง unsupported");
+    const missing = await app.request(`/jobs/${randomUUID()}`, "PATCH", { title: "ทดสอบ" });
+    assert.equal(missing.data.error, "ไม่พบงานนี้");
     const first = await app.request("/jobs", "POST", {
       id,
       title: "ภาพโปรโมชัน Heartopia",
@@ -211,7 +221,7 @@ test("Local API writes real media folders, persists across restart, and recovers
         postUrl: "https://facebook.com/example",
       });
       await app.stop();
-      app = await start(directory);
+      app = await start(directory, undefined, database.url);
       const { data } = await app.request("/studio");
       assert.equal(data.jobs.length, 1);
       assert.equal(data.jobs[0].postStatus, "posted");
@@ -250,10 +260,12 @@ test("Local API writes real media folders, persists across restart, and recovers
 });
 
 test("streaming upload enforces exact size boundary and cleans rejected partial files", async (t) => {
+  const database = await createTestDatabase();
   const directory = await mkdtemp(path.join(tmpdir(), "supersix-size-"));
-  const app = await start(directory, PNG.length);
+  const app = await start(directory, PNG.length, database.url);
   t.after(async () => {
     await app.stop();
+    await database.close();
     await rm(directory, { recursive: true, force: true });
   });
   const created = await app.request("/jobs", "POST", { title: "ทดสอบขนาด" });
@@ -265,10 +277,12 @@ test("streaming upload enforces exact size boundary and cleans rejected partial 
 });
 
 test("an in-flight upload follows shop changes and is discarded after job removal", async (t) => {
+  const database = await createTestDatabase();
   const directory = await mkdtemp(path.join(tmpdir(), "supersix-race-"));
-  const app = await start(directory);
+  const app = await start(directory, undefined, database.url);
   t.after(async () => {
     await app.stop();
+    await database.close();
     await rm(directory, { recursive: true, force: true });
   });
   const job = (await app.request("/jobs", "POST", { title: "งานระหว่างอัปโหลด" })).data.job;
@@ -307,7 +321,7 @@ test("an in-flight upload follows shop changes and is discarded after job remova
     try {
       for (let attempt = 0; ; attempt += 1) {
         if ((await readdir(path.join(directory, ".uploading"))).length) break;
-        if (attempt > 100) throw new Error("Upload did not begin streaming");
+        if (attempt > 1000) throw new Error("Upload did not begin streaming");
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
       await change();
@@ -333,4 +347,66 @@ test("an in-flight upload follows shop changes and is discarded after job remova
   assert.deepEqual(await readdir(path.join(directory, ".uploading")), []);
   const files = await readdir(path.dirname(path.join(directory, moved.data.asset.relativePath)));
   assert.equal(files.length, 1);
+});
+
+test("upload limits, client disconnects and server drain release streams and temporary files", async (t) => {
+  const database = await createTestDatabase();
+  const directory = await mkdtemp(path.join(tmpdir(), "supersix-upload-lifecycle-"));
+  const app = await start(directory, undefined, database.url);
+  const pending = [];
+  t.after(async () => {
+    pending.forEach(({ req }) => req.destroy());
+    await app.stop();
+    await database.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+  const job = (await app.request("/jobs", "POST", { title: "Stream lifecycle" })).data.job;
+  function beginUpload() {
+    const boundary = `studio-${randomUUID()}`;
+    let req;
+    const response = new Promise((resolve) => {
+      req = httpRequest(
+        `${app.base}/jobs/${job.id}/assets`,
+        {
+          method: "POST",
+          headers: { "Content-Type": `multipart/form-data; boundary=${boundary}` },
+        },
+        (res) => {
+          res.resume();
+          res.on("end", () => resolve(res.statusCode));
+        },
+      );
+      req.on("error", () => resolve(0));
+    });
+    req.write(
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="partial.png"\r\nContent-Type: image/png\r\n\r\n`,
+    );
+    req.write(PNG.subarray(0, 20));
+    const upload = { req, response };
+    pending.push(upload);
+    return upload;
+  }
+  async function waitForPartialCount(count) {
+    const deadline = Date.now() + 8000;
+    while ((await readdir(path.join(directory, ".uploading"))).length !== count) {
+      assert.ok(Date.now() < deadline, `Expected ${count} temporary uploads`);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  const first = beginUpload();
+  const second = beginUpload();
+  await waitForPartialCount(2);
+  const limited = await app.upload(job.id);
+  assert.equal(limited.response.status, 429);
+  assert.equal(limited.response.headers.get("retry-after"), "3");
+  first.req.destroy();
+  await first.response;
+  await waitForPartialCount(1);
+  assert.equal((await app.upload(job.id)).response.status, 201);
+  app.drain();
+  assert.equal(await second.response, 503);
+  await waitForPartialCount(0);
+  assert.equal((await app.upload(job.id)).response.status, 503);
+  const data = (await app.request("/studio")).data;
+  assert.equal(data.jobs[0].assets.length, 1);
 });
